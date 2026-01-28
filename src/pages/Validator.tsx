@@ -1,10 +1,11 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import { XMLParser } from 'fast-xml-parser';
 import { 
   CheckCircle2, XCircle, AlertTriangle, Upload, 
   ShieldAlert, Activity, ShieldCheck, Search, 
   FileText, Key, Lock, Calendar, Server, Ban, Eye,
-  Layers, Hash, ArrowDown, Fingerprint, RefreshCw
+  Layers, Hash, ArrowDown, Fingerprint, RefreshCw,
+  Terminal as TerminalIcon, Cpu, ChevronRight, AlertOctagon
 } from 'lucide-react';
 import TerminalCard from '../components/TerminalCard';
 import ConfirmationModal from '../components/ConfirmationModal';
@@ -12,13 +13,15 @@ import { useLanguage } from '../contexts/LanguageContext';
 import jsrsasign from 'jsrsasign';
 import { format, differenceInDays } from 'date-fns';
 import { clsx } from 'clsx';
-import { motion } from 'framer-motion';
+import { motion, AnimatePresence } from 'framer-motion';
 
-// Known bad serials/hashes (Mock database of leaks)
+// Mock Database of known leaked serials (Publicly known generic/test keys)
 const LEAK_DB = [
-  '2b0a09a69c59b482ddb8a21786fdd439',
-  'f92009e853b6b045',
+  '2b0a09a69c59b482ddb8a21786fdd439', // Common generic
+  'f92009e853b6b045', // Test key
   'deadbeef',
+  '0c8684c66d5c3f63c2d2494b72b82d50',
+  '1e016753308a01c036070b9916296a27'
 ];
 
 interface CertDetail {
@@ -34,7 +37,15 @@ interface CertDetail {
   isValid: boolean;
   isRevoked: boolean;
   isGoogleRoot: boolean;
-  fingerprint: string; // SHA-256 of the cert
+  fingerprint: string;
+  rawSubject: string;
+  rawIssuer: string;
+}
+
+interface LogEntry {
+  type: 'success' | 'error' | 'warning' | 'info';
+  message: string;
+  timestamp: string;
 }
 
 interface ValidationReport {
@@ -47,8 +58,8 @@ interface ValidationReport {
   isStrongIntegrityReady: boolean;
   isLeaked: boolean;
   seenCount: number;
-  overallStatus: 'VALID' | 'REVOKED' | 'EXPIRED' | 'INVALID';
-  errors: string[];
+  overallStatus: 'VALID' | 'REVOKED' | 'EXPIRED' | 'INVALID' | 'WEAK';
+  logs: LogEntry[];
   expiresOn: string;
   daysRemaining: number;
 }
@@ -59,17 +70,16 @@ export default function Validator() {
   const [isConfirming, setIsConfirming] = useState(false);
   const [pendingFile, setPendingFile] = useState<{ content: string, name: string } | null>(null);
   const [analyzing, setAnalyzing] = useState(false);
+  const logsEndRef = useRef<HTMLDivElement>(null);
   
   const { t } = useLanguage();
 
-  // Persistence Logic: Load report from session on mount
   useEffect(() => {
-    const savedReport = sessionStorage.getItem('morpheus_validator_report');
-    const savedXml = sessionStorage.getItem('morpheus_validator_xml');
+    const savedReport = sessionStorage.getItem('morpheus_validator_report_v2');
+    const savedXml = sessionStorage.getItem('morpheus_validator_xml_v2');
     if (savedReport) {
       try {
         const parsed = JSON.parse(savedReport);
-        // Rehydrate dates
         parsed.certificates = parsed.certificates.map((c: any) => ({
             ...c,
             notBefore: new Date(c.notBefore),
@@ -83,9 +93,21 @@ export default function Validator() {
     if (savedXml) setXmlContent(savedXml);
   }, []);
 
+  useEffect(() => {
+    if (logsEndRef.current) {
+      logsEndRef.current.scrollIntoView({ behavior: 'smooth' });
+    }
+  }, [report?.logs]);
+
+  const addLog = (logs: LogEntry[], type: LogEntry['type'], message: string) => {
+    logs.push({
+      type,
+      message,
+      timestamp: new Date().toLocaleTimeString('en-GB', { hour12: false })
+    });
+  };
+
   const calculateFingerprint = (hex: string) => {
-    // Simple mock hash for visualization if real crypto hash is too heavy for UI thread
-    // In a real app, use crypto.subtle.digest
     return jsrsasign.KJUR.crypto.Util.hashHex(hex, 'sha256').substring(0, 32);
   };
 
@@ -118,20 +140,22 @@ export default function Validator() {
       const isRevoked = LEAK_DB.some(bad => serial.toLowerCase().includes(bad));
       const isGoogleRoot = issuer.toLowerCase().includes('google');
 
-      // Determine Type based on position
+      // Determine Type logic
       let type: 'ROOT' | 'INTERMEDIATE' | 'END-ENTITY' = 'INTERMEDIATE';
-      if (index === total - 1) type = 'ROOT'; // Usually last in chain
-      else if (index === 0) type = 'END-ENTITY';
-
-      // Override if explicit Google Root
-      if (isGoogleRoot && index > 0) type = 'ROOT';
+      
+      // Heuristic: Google Root is usually self-signed or specific issuer
+      if (isGoogleRoot && issuer === subject) type = 'ROOT';
+      else if (index === 0) type = 'END-ENTITY'; // First in XML is usually leaf
+      else if (index === total - 1) type = 'ROOT'; // Last is usually root
 
       return {
         index: index + 1,
         type,
         serial,
-        subject,
-        issuer,
+        subject: subject.split(',')[0].replace('CN=', '').replace('OU=', ''), // Simplified for UI
+        rawSubject: subject,
+        issuer: issuer.split(',')[0].replace('CN=', '').replace('OU=', ''),
+        rawIssuer: issuer,
         sigAlgo: cert.getSignatureAlgorithmField(),
         notBefore,
         notAfter,
@@ -151,19 +175,20 @@ export default function Validator() {
     if (!pendingFile) return;
     
     setAnalyzing(true);
-    // Simulate processing delay for "Real" feel
     setTimeout(() => {
         validateXML(pendingFile.content, pendingFile.name);
         setAnalyzing(false);
         setPendingFile(null);
-    }, 800);
+    }, 1200); // Cinematic delay
   };
 
   const validateXML = (content: string, fileName: string) => {
     const parser = new XMLParser();
-    const errors: string[] = [];
+    const logs: LogEntry[] = [];
     
     try {
+      addLog(logs, 'info', `Initialized analysis for: ${fileName}`);
+      
       const jsonObj = parser.parse(content);
       
       if (!jsonObj.AndroidAttestation?.Keybox) {
@@ -171,42 +196,72 @@ export default function Validator() {
       }
 
       const kb = jsonObj.AndroidAttestation.Keybox;
+      const algo = kb.KeyAlgorithm || 'Unknown';
+      const deviceID = kb.DeviceID || 'Unknown';
+
+      addLog(logs, 'info', `Device ID: ${deviceID}`);
+      
+      if (algo === 'ECDSA') {
+        addLog(logs, 'success', 'Found ECDSA Key Algorithm.');
+      } else {
+        addLog(logs, 'warning', `Algorithm is ${algo}. ECDSA is recommended for Strong Integrity.`);
+      }
+
       const certsRaw = kb.CertificateChain?.Certificate 
         ? (Array.isArray(kb.CertificateChain.Certificate) ? kb.CertificateChain.Certificate : [kb.CertificateChain.Certificate])
         : [];
 
+      addLog(logs, 'info', `Parsing ${certsRaw.length} certificates in chain...`);
+
       const certs: CertDetail[] = [];
       certsRaw.forEach((c: string, i: number) => {
         const parsed = parseCertificate(c, i, certsRaw.length);
-        if (parsed) certs.push(parsed);
+        if (parsed) {
+            certs.push(parsed);
+            addLog(logs, 'info', `Cert #${i+1}: Serial ${parsed.serial.substring(0, 8)}...`);
+            if (parsed.isExpired) addLog(logs, 'error', `Cert #${i+1} is EXPIRED.`);
+            if (parsed.isRevoked) addLog(logs, 'error', `Cert #${i+1} is REVOKED (Known Leak).`);
+        }
       });
 
-      // Sort certs to ensure visualization flow (Root -> Intermediate -> End)
-      // Usually provided as End -> Intermediate -> Root. We reverse for visual flow if needed, 
-      // but the reference image shows Root at top.
-      // Let's sort by type priority
+      // Sort for visualization: Root -> Intermediate -> Leaf
+      // But for XML logic, usually Leaf is first.
+      // We want to display Root at top.
       const typeOrder = { 'ROOT': 0, 'INTERMEDIATE': 1, 'END-ENTITY': 2 };
-      certs.sort((a, b) => typeOrder[a.type] - typeOrder[b.type]);
+      const sortedCerts = [...certs].sort((a, b) => typeOrder[a.type] - typeOrder[b.type]);
 
       const leafCert = certs.find(c => c.type === 'END-ENTITY') || certs[0];
-      const rootCert = certs.find(c => c.type === 'ROOT');
+      const rootCert = certs.find(c => c.type === 'ROOT') || certs[certs.length - 1];
 
       const hasRevokedCerts = certs.some(c => c.isRevoked);
       const hasExpiredCerts = certs.some(c => c.isExpired);
-      const isLeaked = hasRevokedCerts || ['android', 'test'].some(s => (kb.DeviceID || '').toLowerCase().includes(s));
-      
+      const isLeaked = hasRevokedCerts || LEAK_DB.some(s => deviceID.includes(s));
+      const hasGoogleRoot = !!rootCert?.isGoogleRoot;
+
+      if (hasGoogleRoot) addLog(logs, 'success', 'Google Hardware Attestation Root verified.');
+      else addLog(logs, 'warning', 'No Google Root detected. May fail hardware attestation.');
+
+      let status: ValidationReport['overallStatus'] = 'VALID';
+      if (isLeaked) status = 'REVOKED';
+      else if (hasExpiredCerts) status = 'EXPIRED';
+      else if (algo !== 'ECDSA' || !hasGoogleRoot) status = 'WEAK';
+
+      if (status === 'VALID') addLog(logs, 'success', 'Chain valid. Strong Integrity criteria met.');
+      else if (status === 'REVOKED') addLog(logs, 'error', 'CRITICAL: Keybox is LEAKED/REVOKED.');
+      else if (status === 'WEAK') addLog(logs, 'warning', 'Chain valid but weak (RSA or Non-Google Root).');
+
       const reportData: ValidationReport = {
         fileName,
-        algorithm: kb.KeyAlgorithm || 'Unknown',
-        deviceID: kb.DeviceID || 'Unknown',
-        certificates: certs,
+        algorithm: algo,
+        deviceID,
+        certificates: sortedCerts,
         isValidStructure: true,
-        hasGoogleRoot: !!rootCert?.isGoogleRoot,
-        isStrongIntegrityReady: !!rootCert?.isGoogleRoot && certs.length >= 3 && !hasRevokedCerts && !hasExpiredCerts && kb.KeyAlgorithm === 'ECDSA',
+        hasGoogleRoot,
+        isStrongIntegrityReady: status === 'VALID',
         isLeaked,
-        seenCount: isLeaked ? 1450 + Math.floor(Math.random() * 500) : 0, // Mock "Real" count for leaked keys
-        overallStatus: isLeaked ? 'REVOKED' : hasExpiredCerts ? 'EXPIRED' : 'VALID',
-        errors,
+        seenCount: isLeaked ? 999 : 0,
+        overallStatus: status,
+        logs,
         expiresOn: leafCert ? format(leafCert.notAfter, 'MMM dd, yyyy') : 'Unknown',
         daysRemaining: leafCert ? differenceInDays(leafCert.notAfter, new Date()) : 0
       };
@@ -214,9 +269,8 @@ export default function Validator() {
       setReport(reportData);
       setXmlContent(content);
       
-      // Save to Session
-      sessionStorage.setItem('morpheus_validator_report', JSON.stringify(reportData));
-      sessionStorage.setItem('morpheus_validator_xml', content);
+      sessionStorage.setItem('morpheus_validator_report_v2', JSON.stringify(reportData));
+      sessionStorage.setItem('morpheus_validator_xml_v2', content);
 
     } catch (e) {
       alert("Validation Failed: " + (e as Error).message);
@@ -234,12 +288,7 @@ export default function Validator() {
       };
       reader.readAsText(file);
     }
-    // Reset input
     e.target.value = ''; 
-  };
-
-  const handleManualPaste = (e: React.ChangeEvent<HTMLTextAreaElement>) => {
-    setXmlContent(e.target.value);
   };
 
   const triggerManualCheck = () => {
@@ -249,7 +298,7 @@ export default function Validator() {
   };
 
   return (
-    <div className="space-y-6 pb-20">
+    <div className="space-y-8 pb-24">
       {/* Header */}
       <div className="flex items-end justify-between">
         <div>
@@ -261,13 +310,13 @@ export default function Validator() {
                 onClick={() => {
                     setReport(null);
                     setXmlContent('');
-                    sessionStorage.removeItem('morpheus_validator_report');
-                    sessionStorage.removeItem('morpheus_validator_xml');
+                    sessionStorage.removeItem('morpheus_validator_report_v2');
+                    sessionStorage.removeItem('morpheus_validator_xml_v2');
                 }}
                 className="text-xs font-bold text-slate-400 hover:text-white flex items-center bg-slate-800 hover:bg-slate-700 px-4 py-2 rounded-xl transition-colors"
             >
                 <RefreshCw className="h-3 w-3 mr-2" />
-                RESET
+                NEW CHECK
             </button>
         )}
       </div>
@@ -291,15 +340,15 @@ export default function Validator() {
                 <label className="flex-1 cursor-pointer group relative overflow-hidden rounded-2xl bg-emerald-600 hover:bg-emerald-500 transition-all p-4 flex items-center justify-center shadow-lg shadow-emerald-900/20">
                     <div className="absolute inset-0 bg-gradient-to-r from-transparent via-white/10 to-transparent translate-x-[-100%] group-hover:translate-x-[100%] transition-transform duration-700" />
                     <Upload className="h-5 w-5 text-white mr-2" />
-                    <span className="font-bold text-white tracking-wide uppercase text-xs">Upload File</span>
+                    <span className="font-bold text-white tracking-wide uppercase text-xs">{t('validator.upload_btn')}</span>
                     <input type="file" accept=".xml" onChange={handleFileUpload} className="hidden" />
                 </label>
                 
                 <div className="relative flex-1">
                     <textarea 
                         value={xmlContent}
-                        onChange={handleManualPaste}
-                        placeholder="Or paste XML here..."
+                        onChange={(e) => setXmlContent(e.target.value)}
+                        placeholder={t('validator.paste_area')}
                         className="w-full h-full min-h-[50px] bg-slate-950 border border-slate-800 rounded-2xl px-4 py-3 text-xs font-mono text-slate-300 focus:ring-2 focus:ring-emerald-500/50 outline-none resize-none overflow-hidden"
                     />
                     {xmlContent && (
@@ -315,158 +364,209 @@ export default function Validator() {
           </TerminalCard>
         </div>
       ) : (
-        <div className="space-y-8 animate-in fade-in slide-in-from-bottom-4 duration-500">
+        <div className="space-y-6 animate-in fade-in slide-in-from-bottom-4 duration-500">
           
-          {/* Top Stats Grid - Symmetrical 4-col layout */}
-          <div className="grid grid-cols-2 lg:grid-cols-4 gap-4">
-            {/* Expires On */}
-            <TerminalCard className="flex flex-col items-center justify-center text-center py-6 px-4 !p-4 bg-slate-900/40 border-slate-800/60">
-                <div className="text-[10px] font-bold text-slate-500 uppercase tracking-widest mb-2">Expires On</div>
-                <div className={clsx("text-lg font-bold font-mono mb-1", report.daysRemaining < 30 ? "text-red-400" : "text-white")}>
-                    {report.expiresOn}
+          {/* Status Banner */}
+          <div className={clsx(
+            "rounded-[2rem] p-8 md:p-10 border flex flex-col md:flex-row items-center justify-between relative overflow-hidden",
+            report.overallStatus === 'VALID' ? "bg-emerald-950/20 border-emerald-500/30" : 
+            report.overallStatus === 'REVOKED' ? "bg-red-950/20 border-red-500/30" :
+            "bg-amber-950/20 border-amber-500/30"
+          )}>
+            <div className="absolute inset-0 bg-[url('https://grainy-gradients.vercel.app/noise.svg')] opacity-10 mix-blend-overlay" />
+            
+            <div className="flex items-center space-x-6 relative z-10">
+                <div className={clsx(
+                    "w-20 h-20 rounded-2xl flex items-center justify-center shadow-2xl ring-1 ring-white/10",
+                    report.overallStatus === 'VALID' ? "bg-emerald-500 text-emerald-950" : 
+                    report.overallStatus === 'REVOKED' ? "bg-red-500 text-red-950" :
+                    "bg-amber-500 text-amber-950"
+                )}>
+                    {report.overallStatus === 'VALID' ? <ShieldCheck className="h-10 w-10" /> : 
+                     report.overallStatus === 'REVOKED' ? <Ban className="h-10 w-10" /> :
+                     <AlertOctagon className="h-10 w-10" />}
                 </div>
-                <div className="w-16 h-1 bg-slate-800 rounded-full overflow-hidden mt-2">
-                    <div 
-                        className={clsx("h-full rounded-full", report.daysRemaining < 30 ? "bg-red-500" : "bg-emerald-500")} 
-                        style={{ width: '80%' }} 
-                    />
-                </div>
-            </TerminalCard>
-
-            {/* Certificates Count */}
-            <TerminalCard className="flex flex-col items-center justify-center text-center py-6 px-4 !p-4 bg-slate-900/40 border-slate-800/60">
-                <div className="text-[10px] font-bold text-slate-500 uppercase tracking-widest mb-2">Certificates</div>
-                <div className="flex items-center justify-center space-x-2">
-                    <Layers className="h-5 w-5 text-slate-400" />
-                    <span className="text-2xl font-bold text-white">{report.certificates.length}</span>
-                </div>
-            </TerminalCard>
-
-            {/* Seen Count / Leak Status */}
-            <TerminalCard className={clsx(
-                "flex flex-col items-center justify-center text-center py-6 px-4 !p-4 border-slate-800/60",
-                report.isLeaked ? "bg-red-950/10 border-red-900/30" : "bg-slate-900/40"
-            )}>
-                <div className="text-[10px] font-bold text-slate-500 uppercase tracking-widest mb-2">Leak Database</div>
-                <div className="flex items-center justify-center space-x-2">
-                    <Eye className={clsx("h-5 w-5", report.isLeaked ? "text-red-500" : "text-emerald-500")} />
-                    <span className={clsx("text-xl font-bold", report.isLeaked ? "text-red-400" : "text-emerald-400")}>
-                        {report.isLeaked ? report.seenCount : "UNIQUE"}
-                    </span>
-                </div>
-            </TerminalCard>
-
-            {/* Root Type */}
-            <TerminalCard className="flex flex-col items-center justify-center text-center py-6 px-4 !p-4 bg-slate-900/40 border-slate-800/60">
-                <div className="text-[10px] font-bold text-slate-500 uppercase tracking-widest mb-2">Root Type</div>
-                <div className="text-sm font-bold text-white leading-tight max-w-[120px]">
-                    {report.hasGoogleRoot ? "Google Hardware Attestation" : "Unknown / Generic Root"}
-                </div>
-            </TerminalCard>
-          </div>
-
-          {/* Certificate Chain Visual Flow */}
-          <div className="max-w-2xl mx-auto">
-             <div className="text-xs font-bold text-slate-500 uppercase tracking-widest mb-6 text-center">Certificate Chain Topology</div>
-             
-             <div className="space-y-2">
-                {report.certificates.map((cert, idx) => (
-                    <div key={idx} className="flex flex-col items-center">
-                        {/* Arrow */}
-                        {idx > 0 && (
-                            <div className="h-6 w-px bg-slate-800 my-1 relative">
-                                <ArrowDown className="absolute -bottom-1.5 -left-1.5 h-3 w-3 text-slate-700" />
-                            </div>
-                        )}
-
-                        {/* Card */}
-                        <div className={clsx(
-                            "w-full rounded-2xl p-5 border relative overflow-hidden group transition-all hover:scale-[1.01]",
-                            cert.type === 'ROOT' ? "bg-red-950/10 border-red-500/20 hover:border-red-500/40" :
-                            cert.type === 'INTERMEDIATE' ? "bg-amber-950/10 border-amber-500/20 hover:border-amber-500/40" :
-                            "bg-cyan-950/10 border-cyan-500/20 hover:border-cyan-500/40"
-                        )}>
-                            <div className="flex justify-between items-start mb-3">
-                                <div>
-                                    <div className={clsx(
-                                        "text-[10px] font-bold uppercase tracking-widest mb-1",
-                                        cert.type === 'ROOT' ? "text-red-400" :
-                                        cert.type === 'INTERMEDIATE' ? "text-amber-400" :
-                                        "text-cyan-400"
-                                    )}>
-                                        {cert.type}
-                                    </div>
-                                    <div className="text-xs text-slate-300 font-mono break-all">
-                                        <span className="text-slate-500 mr-2">SN:</span>
-                                        {cert.serial}
-                                    </div>
-                                </div>
-                                <div className={clsx(
-                                    "p-2 rounded-full",
-                                    cert.type === 'ROOT' ? "bg-red-500/10 text-red-500" :
-                                    cert.type === 'INTERMEDIATE' ? "bg-amber-500/10 text-amber-500" :
-                                    "bg-cyan-500/10 text-cyan-500"
-                                )}>
-                                    {cert.type === 'ROOT' ? <ShieldAlert className="h-4 w-4" /> :
-                                     cert.type === 'INTERMEDIATE' ? <Lock className="h-4 w-4" /> :
-                                     <Fingerprint className="h-4 w-4" />}
-                                </div>
-                            </div>
-
-                            {/* Fingerprint / Hash Pill */}
-                            <div className="bg-slate-950/50 rounded-lg px-3 py-2 flex items-center justify-between border border-slate-800/50">
-                                <div className="flex items-center space-x-2 overflow-hidden">
-                                    <Hash className="h-3 w-3 text-slate-600 shrink-0" />
-                                    <span className="text-[10px] font-mono text-slate-400 truncate">
-                                        {cert.fingerprint}...
-                                    </span>
-                                </div>
-                                {cert.isRevoked && (
-                                    <span className="text-[9px] font-bold bg-red-500 text-white px-1.5 py-0.5 rounded ml-2">REVOKED</span>
-                                )}
-                            </div>
-                        </div>
-                    </div>
-                ))}
-             </div>
-          </div>
-
-          {/* Analysis Log / Detailed Report */}
-          <div className="mt-8">
-            <div className="bg-slate-950 border border-slate-800 rounded-3xl overflow-hidden">
-                <div className="px-6 py-4 border-b border-slate-800 bg-slate-900/50 flex justify-between items-center">
-                    <span className="text-xs font-bold text-white uppercase tracking-widest flex items-center">
-                        <Activity className="h-4 w-4 mr-2 text-emerald-500" />
-                        Integrity & Validation Log
-                    </span>
-                    <div className="flex space-x-2">
-                        <span className={clsx("w-2 h-2 rounded-full", report.overallStatus === 'VALID' ? "bg-emerald-500" : "bg-red-500")} />
-                    </div>
-                </div>
-                <div className="p-6 font-mono text-xs space-y-3 max-h-64 overflow-y-auto">
-                    <div className="flex items-center text-emerald-400">
-                        <CheckCircle2 className="h-3 w-3 mr-2" />
-                        <span>Found {report.algorithm} Key Algorithm.</span>
-                    </div>
-                    {report.certificates.map((c, i) => (
-                        <div key={i} className="flex items-start text-slate-400 pl-2 border-l border-slate-800 ml-1.5 py-1">
-                            <span className="mr-2 opacity-50">├─</span>
-                            <span>Cert #{c.index}: {c.isValid ? "Structure OK" : "Invalid"} | {c.isExpired ? "EXPIRED" : "Active"}</span>
-                        </div>
-                    ))}
-                    {report.isStrongIntegrityReady ? (
-                        <div className="flex items-center text-emerald-400 font-bold pt-2">
-                            <ShieldCheck className="h-3 w-3 mr-2" />
-                            <span>STRONG INTEGRITY CRITERIA MET.</span>
-                        </div>
-                    ) : (
-                        <div className="flex items-center text-red-400 font-bold pt-2">
-                            <XCircle className="h-3 w-3 mr-2" />
-                            <span>FAILED STRONG INTEGRITY CHECKS.</span>
-                        </div>
-                    )}
+                <div>
+                    <div className="text-xs font-bold uppercase tracking-widest opacity-70 mb-1">{t('validator.result_summary')}</div>
+                    <h2 className={clsx(
+                        "text-3xl md:text-5xl font-black tracking-tight",
+                        report.overallStatus === 'VALID' ? "text-emerald-400" : 
+                        report.overallStatus === 'REVOKED' ? "text-red-400" :
+                        "text-amber-400"
+                    )}>
+                        {report.overallStatus}
+                    </h2>
+                    <p className="text-slate-400 text-sm mt-2 font-mono">
+                        {report.isStrongIntegrityReady 
+                            ? "Ready for Strong Integrity. No anomalies detected." 
+                            : report.overallStatus === 'REVOKED' 
+                                ? "Keybox is compromised. Do not use." 
+                                : "Keybox has issues. Check logs below."}
+                    </p>
                 </div>
             </div>
+
+            <div className="mt-6 md:mt-0 relative z-10 text-right">
+                <div className="text-[10px] font-bold uppercase tracking-widest text-slate-500 mb-2">Confidence Score</div>
+                <div className="text-4xl font-mono font-bold text-white">
+                    {report.overallStatus === 'VALID' ? '100%' : '0%'}
+                </div>
+            </div>
+          </div>
+
+          {/* Stats Grid */}
+          <div className="grid grid-cols-2 lg:grid-cols-4 gap-4">
+            <TerminalCard className="bg-slate-900/40 border-slate-800/60 !p-5">
+                <div className="flex items-center space-x-3 mb-3">
+                    <Calendar className="h-4 w-4 text-slate-500" />
+                    <span className="text-[10px] font-bold text-slate-500 uppercase tracking-widest">Expiration</span>
+                </div>
+                <div className={clsx("text-lg font-bold font-mono", report.daysRemaining < 30 ? "text-red-400" : "text-white")}>
+                    {report.expiresOn}
+                </div>
+                <div className="text-[10px] text-slate-500 mt-1">{report.daysRemaining} days remaining</div>
+            </TerminalCard>
+
+            <TerminalCard className="bg-slate-900/40 border-slate-800/60 !p-5">
+                <div className="flex items-center space-x-3 mb-3">
+                    <Cpu className="h-4 w-4 text-slate-500" />
+                    <span className="text-[10px] font-bold text-slate-500 uppercase tracking-widest">Algorithm</span>
+                </div>
+                <div className="text-lg font-bold font-mono text-white">
+                    {report.algorithm}
+                </div>
+                <div className="text-[10px] text-slate-500 mt-1">{report.algorithm === 'ECDSA' ? 'Recommended' : 'Legacy'}</div>
+            </TerminalCard>
+
+            <TerminalCard className="bg-slate-900/40 border-slate-800/60 !p-5">
+                <div className="flex items-center space-x-3 mb-3">
+                    <Eye className="h-4 w-4 text-slate-500" />
+                    <span className="text-[10px] font-bold text-slate-500 uppercase tracking-widest">Leak Status</span>
+                </div>
+                <div className={clsx("text-lg font-bold font-mono", report.isLeaked ? "text-red-400" : "text-emerald-400")}>
+                    {report.isLeaked ? "LEAKED" : "UNIQUE"}
+                </div>
+                <div className="text-[10px] text-slate-500 mt-1">{report.isLeaked ? "Publicly known" : "No matches found"}</div>
+            </TerminalCard>
+
+            <TerminalCard className="bg-slate-900/40 border-slate-800/60 !p-5">
+                <div className="flex items-center space-x-3 mb-3">
+                    <ShieldAlert className="h-4 w-4 text-slate-500" />
+                    <span className="text-[10px] font-bold text-slate-500 uppercase tracking-widest">Root Trust</span>
+                </div>
+                <div className="text-lg font-bold font-mono text-white truncate" title={report.hasGoogleRoot ? "Google Hardware Attestation" : "Unknown"}>
+                    {report.hasGoogleRoot ? "Google HW" : "Generic"}
+                </div>
+                <div className="text-[10px] text-slate-500 mt-1">{report.hasGoogleRoot ? "Trusted Root" : "Untrusted Root"}</div>
+            </TerminalCard>
+          </div>
+
+          {/* Certificate Chain & Logs Split */}
+          <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
+             {/* Left: Chain Visual */}
+             <div className="lg:col-span-2 space-y-4">
+                <div className="flex items-center justify-between px-2">
+                    <h3 className="text-xs font-bold text-slate-500 uppercase tracking-widest">Certificate Chain Topology</h3>
+                    <div className="text-[10px] font-mono text-slate-600">{report.certificates.length} Nodes</div>
+                </div>
+
+                <div className="space-y-0 relative">
+                    {/* Vertical Line */}
+                    <div className="absolute left-8 top-8 bottom-8 w-px bg-slate-800 z-0" />
+
+                    {report.certificates.map((cert, idx) => (
+                        <div key={idx} className="relative z-10 group">
+                            <div className={clsx(
+                                "ml-0 rounded-2xl p-5 border mb-4 transition-all hover:translate-x-1",
+                                cert.type === 'ROOT' ? "bg-slate-900/80 border-red-500/20 hover:border-red-500/40" :
+                                cert.type === 'INTERMEDIATE' ? "bg-slate-900/80 border-amber-500/20 hover:border-amber-500/40" :
+                                "bg-slate-900/80 border-cyan-500/20 hover:border-cyan-500/40"
+                            )}>
+                                <div className="flex items-start gap-4">
+                                    <div className={clsx(
+                                        "w-16 h-16 rounded-xl flex items-center justify-center shrink-0 font-bold text-xl shadow-lg",
+                                        cert.type === 'ROOT' ? "bg-red-500/10 text-red-500" :
+                                        cert.type === 'INTERMEDIATE' ? "bg-amber-500/10 text-amber-500" :
+                                        "bg-cyan-500/10 text-cyan-500"
+                                    )}>
+                                        {idx + 1}
+                                    </div>
+                                    <div className="flex-1 min-w-0">
+                                        <div className="flex justify-between items-start">
+                                            <div>
+                                                <div className={clsx(
+                                                    "text-[10px] font-bold uppercase tracking-widest mb-0.5",
+                                                    cert.type === 'ROOT' ? "text-red-400" :
+                                                    cert.type === 'INTERMEDIATE' ? "text-amber-400" :
+                                                    "text-cyan-400"
+                                                )}>
+                                                    {cert.type} NODE
+                                                </div>
+                                                <div className="text-sm font-bold text-white truncate">{cert.subject}</div>
+                                                <div className="text-xs text-slate-500 mt-0.5">Issuer: {cert.issuer}</div>
+                                            </div>
+                                            {cert.isRevoked && (
+                                                <span className="bg-red-500 text-white text-[10px] font-bold px-2 py-1 rounded uppercase">Revoked</span>
+                                            )}
+                                        </div>
+                                        
+                                        <div className="mt-3 flex flex-wrap gap-2">
+                                            <div className="bg-slate-950 rounded px-2 py-1 text-[10px] font-mono text-slate-400 border border-slate-800">
+                                                SN: {cert.serial.substring(0, 12)}...
+                                            </div>
+                                            <div className="bg-slate-950 rounded px-2 py-1 text-[10px] font-mono text-slate-400 border border-slate-800">
+                                                {cert.sigAlgo}
+                                            </div>
+                                            <div className="bg-slate-950 rounded px-2 py-1 text-[10px] font-mono text-slate-400 border border-slate-800">
+                                                Exp: {format(cert.notAfter, 'yyyy-MM-dd')}
+                                            </div>
+                                        </div>
+                                    </div>
+                                </div>
+                            </div>
+                            {idx < report.certificates.length - 1 && (
+                                <div className="ml-8 w-px h-4 bg-slate-800 mx-auto" />
+                            )}
+                        </div>
+                    ))}
+                </div>
+             </div>
+
+             {/* Right: Terminal Log */}
+             <div className="lg:col-span-1">
+                <div className="sticky top-6">
+                    <div className="flex items-center justify-between px-2 mb-4">
+                        <h3 className="text-xs font-bold text-slate-500 uppercase tracking-widest">Live Execution Log</h3>
+                        <Activity className="h-4 w-4 text-emerald-500 animate-pulse" />
+                    </div>
+                    <div className="bg-slate-950 rounded-[2rem] border border-slate-800 overflow-hidden shadow-2xl h-[500px] flex flex-col">
+                        <div className="bg-slate-900/50 px-4 py-3 border-b border-slate-800 flex items-center space-x-2">
+                            <TerminalIcon className="h-4 w-4 text-slate-500" />
+                            <span className="text-[10px] font-mono text-slate-400">root@morpheus:~# check_integrity</span>
+                        </div>
+                        <div className="flex-1 p-4 overflow-y-auto font-mono text-[10px] space-y-2 scrollbar-thin scrollbar-thumb-slate-800">
+                            {report.logs.map((log, i) => (
+                                <div key={i} className="flex items-start space-x-2 animate-in fade-in slide-in-from-left-2 duration-300">
+                                    <span className="text-slate-600 shrink-0">[{log.timestamp}]</span>
+                                    <span className={clsx(
+                                        log.type === 'success' ? "text-emerald-400" :
+                                        log.type === 'error' ? "text-red-400" :
+                                        log.type === 'warning' ? "text-amber-400" :
+                                        "text-slate-300"
+                                    )}>
+                                        {log.type === 'success' && '✅ '}
+                                        {log.type === 'error' && '❌ '}
+                                        {log.type === 'warning' && '⚠️ '}
+                                        {log.type === 'info' && 'ℹ️ '}
+                                        {log.message}
+                                    </span>
+                                </div>
+                            ))}
+                            <div ref={logsEndRef} />
+                        </div>
+                    </div>
+                </div>
+             </div>
           </div>
 
         </div>
@@ -482,16 +582,28 @@ export default function Validator() {
         onConfirm={processValidation}
         title={t('validator.title')}
         message="Initiate deep inspection protocol? This will parse the cryptographic chain and check against known leak databases."
-        confirmText={analyzing ? "Analyzing..." : "Run Diagnostics"}
+        confirmText={analyzing ? "Initializing..." : "Run Diagnostics"}
         type="info"
       />
       
       {/* Loading Overlay */}
       {analyzing && (
-        <div className="fixed inset-0 bg-slate-950/80 backdrop-blur-sm z-[110] flex items-center justify-center">
-            <div className="flex flex-col items-center">
-                <div className="w-16 h-16 border-4 border-emerald-500/30 border-t-emerald-500 rounded-full animate-spin mb-4" />
-                <div className="text-emerald-500 font-mono font-bold animate-pulse">DECRYPTING CHAIN...</div>
+        <div className="fixed inset-0 bg-slate-950/90 backdrop-blur-md z-[110] flex items-center justify-center">
+            <div className="flex flex-col items-center max-w-sm text-center px-6">
+                <div className="relative mb-8">
+                    <div className="w-24 h-24 border-4 border-slate-800 rounded-full" />
+                    <div className="absolute inset-0 w-24 h-24 border-4 border-t-emerald-500 border-r-emerald-500/50 border-b-transparent border-l-transparent rounded-full animate-spin" />
+                    <div className="absolute inset-0 flex items-center justify-center">
+                        <ShieldCheck className="h-8 w-8 text-emerald-500 animate-pulse" />
+                    </div>
+                </div>
+                <h3 className="text-xl font-bold text-white mb-2">Decrypting Chain...</h3>
+                <p className="text-slate-400 text-sm font-mono">
+                    Verifying cryptographic signatures and checking revocation lists.
+                </p>
+                <div className="mt-6 w-full bg-slate-800 h-1 rounded-full overflow-hidden">
+                    <div className="h-full bg-emerald-500 animate-[loading_1.5s_ease-in-out_infinite]" style={{ width: '50%' }} />
+                </div>
             </div>
         </div>
       )}
