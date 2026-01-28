@@ -1,0 +1,60 @@
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500;700&display=swap');
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  html {
+    /* Mobile base size */
+    font-size: 12px; 
+  }
+
+  @screen md {
+    html {
+      /* Desktop base size */
+      font-size: 18px;
+    }
+  }
+
+  body {
+    @apply bg-slate-950 text-slate-200 antialiased font-sans;
+    /* Ensure text scales correctly with rem units based on html font-size */
+  }
+  
+  /* Custom Scrollbar for Terminal Feel */
+  ::-webkit-scrollbar {
+    width: 6px;
+    height: 6px;
+  }
+  
+  ::-webkit-scrollbar-track {
+    @apply bg-slate-950;
+  }
+  
+  ::-webkit-scrollbar-thumb {
+    @apply bg-slate-800 rounded-full hover:bg-slate-700 transition-colors;
+  }
+}
+
+/* Glassmorphism Utilities */
+.glass {
+  @apply bg-white/5 backdrop-blur-lg border border-white/10;
+}
+
+.glass-panel {
+  @apply bg-slate-900/60 backdrop-blur-xl border border-slate-800 shadow-xl;
+}
+
+/* Material 3 Expressive Shapes */
+.shape-l {
+  @apply rounded-[2rem];
+}
+
+.shape-m {
+  @apply rounded-[1.5rem];
+}
+
+.shape-s {
+  @apply rounded-2xl;
+}
